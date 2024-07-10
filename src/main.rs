@@ -1,76 +1,105 @@
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 use eframe::egui;
-use tokio::io::{self, AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
+use std::sync::Arc;
+use parking_lot::Mutex;
+use egui::*;
+struct AppState {
+    input: String,
+    tx: mpsc::Sender<String>,
+}
 
-#[tokio::main]
-async fn main() {
-    // 创建一个异步通道
+fn main() -> eframe::Result<()> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let (tx, mut rx) = mpsc::channel(32);
-
-    // 启动一个 tokio 任务来读取终端输入
-    tokio::spawn(async move {
-        let stdin = io::stdin();
-        let mut reader = BufReader::new(stdin).lines();
-        while let Some(line) = reader.next_line().await.unwrap() {
-            let a = line.clone() + "aaa";
-            //print!("{}",a);
-            if tx.send(line).await.is_err() {
-                break;
-            }
+    
+    // 启动Tokio任务来接收和打印消息
+    rt.spawn(async move {
+        while let Some(message) = rx.recv().await {
+            println!("Received: {}", message);
         }
     });
 
-    // 共享接收器
-    let rx = Arc::new(Mutex::new(rx));
+    let state = Arc::new(Mutex::new(AppState {
+        input: String::new(),
+        tx,
+    }));
 
-    // 运行 egui 应用
-    let app = MyApp {
-        rx: Arc::clone(&rx),
-        messages: vec![],
-    };
-    let native_options = eframe::NativeOptions::default();
-    match eframe::run_native(
-        "test",
-        native_options,
-        Box::new(|_cc| Ok(Box::new(app))),
-    ) {
-        Ok(_) => {}
-        Err(e) => {
-            println!("{:?}", e)
-        }
-    }
+    let options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "egui 向 Tokio 发送数据示例",
+        options,
+        Box::new(|_cc| Box::new(MyApp::new(state, rt, _cc))),
+    )
 }
 
 struct MyApp {
-    rx: Arc<Mutex<mpsc::Receiver<String>>>,
-    messages: Vec<String>,
+    state: Arc<Mutex<AppState>>,
+    rt: tokio::runtime::Runtime,
+}
+
+impl MyApp {
+    fn new(state: Arc<Mutex<AppState>>, rt: tokio::runtime::Runtime, cc: &eframe::CreationContext<'_>) -> Self {
+        setup_custom_fonts(&cc.egui_ctx);
+        Self { state, rt }
+    }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 检查是否有新消息
-        let mut rx = self.rx.lock().unwrap();
-        while let Ok(msg) = rx.try_recv() {
-            self.messages.push(msg);
-        }
-        drop(rx); // 释放锁
-
-        // 处理消息以删除倒数第二个换行符及其之前的内容
-        let combined_messages: String = self.messages.join("\n");
-        let processed_message = remove_second_last_newline(&combined_messages);
-
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Messages from Terminal:");
-            ui.label(processed_message);
+            ui.heading("egui 向 Tokio 发送数据示例");
+            
+            let mut state = self.state.lock();
+            
+            ui.horizontal(|ui| {
+                ui.label("输入消息：");
+                ui.text_edit_singleline(&mut state.input);
+            });
+
+            if ui.button("发送").clicked() {
+                if !state.input.is_empty() {
+                    let tx = state.tx.clone();
+                    let message = state.input.clone();
+                    
+                    // 在Tokio运行时中发送消息
+                    self.rt.spawn(async move {
+                        if let Err(e) = tx.send(message).await {
+                            eprintln!("发送错误: {}", e);
+                        }
+                    });
+                }
+            }
         });
     }
 }
+fn setup_custom_fonts(ctx: &egui::Context) {
+    // Start with the default fonts (we will be adding to them rather than replacing them).
+    let mut fonts = egui::FontDefinitions::default();
 
-fn remove_second_last_newline(text: &str) -> String {
-    let mut parts: Vec<&str> = text.split('\n').collect();
-    if parts.len() > 1 {
-        parts.remove(parts.len() - 2);
-    }
-    parts.join("\n")
+    // Install my own font (maybe supporting non-latin characters).
+    // .ttf and .otf files supported.
+    fonts.font_data.insert(
+        "Song".to_owned(),
+        egui::FontData::from_static(include_bytes!("./font/STSong.ttf")),
+    );
+    fonts.families.insert(
+        FontFamily::Name("Song".into()),
+        vec!["Song".to_owned()],
+    );
+    // Put my font first (highest priority) for proportional text:
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "Song".to_owned());
+
+    // Put my font as last fallback for monospace:
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("Song".to_owned());
+
+    // Tell egui to use these fonts:
+    ctx.set_fonts(fonts);
 }
